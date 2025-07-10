@@ -1,452 +1,193 @@
 import json
 import sqlite3
-import mysql.connector
-import ipaddress
 import requests
-from urllib.parse import urlparse, parse_qs
-import re
+import os
+import time
+import jdatetime
 import string
 import random
-import time
-import os
+import ipaddress
+
+# --- تنظیمات ---
+# آدرس کامل فایل api.php در سرور ایران
+API_URL = config.server_address
+# این کلید باید دقیقا مشابه کلید در فایل api.php باشد
+API_KEY = config.api_token
 
 
-# import config.py
-import config
+DB_URL = "/etc/x-ui/x-ui.db"
+# DB_URL = "x-ui.db"
 
-mydb = mysql.connector.connect(
-  host=config.server_address,
-  user="manager",
-  password="nazari@0794054171@As",
-  database="lhs",
-  
-)
-import jdatetime
-
-dburl = "/etc/x-ui/x-ui.db"
-# dburl = "x-ui.db"
-
-# run query
-conn = sqlite3.connect(dburl)
-
-def sendMessageToTelegramBot(message):
-    APITOKEN = "6117050323:AAGBvHWFrfR-c8vNHH7Bnl1ittQl2VU0NdE"
-
-    # آیدی چت گروه یا کاربری که میخوای پیام رو بهش بفرستی رو اینجا قرار بده
-    chat_id = "@vps_status"
-
-    # URL آدرس API برای ارسال پیام
-    url = f"https://api.telegram.org/bot{APITOKEN}/sendMessage"
-
-    # پارامترهای بدنه درخواست
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        
+# --- توابع کمکی (بسیاری از آن‌ها از کد قبلی شما هستند) ---
+def send_api_request(endpoint, data=None, method='POST'):
+    """یک تابع جامع برای ارسال درخواست به API"""
+    headers = {
+        'Authorization': f'Bearer {API_KEY}',
+        'Content-Type': 'application/json'
     }
+    url = f"{API_URL}?action={endpoint}"
+    
+    try:
+        if method.upper() == 'POST':
+            response = requests.post(url, headers=headers, json=data, timeout=30)
+        elif method.upper() == 'GET':
+            response = requests.get(url, headers=headers, timeout=30)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
 
-    # ارسال درخواست POST به آدرس API
-    response = requests.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error communicating with API at endpoint '{endpoint}': {e}")
+        return None
 
-    # بررسی وضعیت پاسخ
-    if response.status_code == 200:
-        return "پیام با موفقیت ارسال شد."
-    else:
-        return "مشکلی در ارسال پیام به وجود آمد."
+def randomStringDigits(stringLength=16):
+    lettersAndDigits = string.ascii_letters + string.digits
+    return ''.join(random.choice(lettersAndDigits) for i in range(stringLength))
 
+def create_user_local(conn, inbound_port, uuid, total_gb, title, expire_days):
+    """تابع اصلی برای ساخت کاربر در دیتابیس محلی SQLite"""
+    total_bytes = int(total_gb) * 1024 * 1024 * 1024 if total_gb != 0 else 0
+    expire_timestamp = ((int(expire_days) * 86400) + int(time.time())) * 1000 if int(expire_days) != 0 else 0
+    
+    cursor = conn.cursor()
+
+    # چک کردن تکراری بودن کاربر
+    cursor.execute("SELECT id FROM client_traffics WHERE email = ?", (title,))
+    if cursor.fetchone():
+        return {"status": "error", "message": "title already exists"}
+
+    # پیدا کردن اینباند
+    cursor.execute("SELECT settings, id FROM inbounds WHERE port = ? LIMIT 1", (int(inbound_port),))
+    inbound_data = cursor.fetchone()
+    if not inbound_data:
+        return {"status": "error", "message": f"Inbound with port {inbound_port} not found"}
+    
+    settings_json, inbound_id = inbound_data
+    settings = json.loads(settings_json)
+    
+    # چک کردن تکراری بودن uuid
+    for client in settings.get('clients', []):
+        if client.get('id') == str(uuid):
+            return {"status": "error", "message": "uuid already exists"}
+
+    # ساختن کلاینت جدید
+    if not settings.get('clients'):
+        return {"status": "error", "message": "No client template found in inbound"}
+
+    new_client = settings['clients'][0].copy()
+    new_client.update({
+        'id': str(uuid),
+        'email': str(title),
+        'totalGB': total_bytes,
+        'expiryTime': expire_timestamp,
+        'enable': True,
+        'subId': randomStringDigits()
+    })
+    
+    settings['clients'].append(new_client)
+    
+    try:
+        # آپدیت جدول inbounds
+        cursor.execute("UPDATE inbounds SET settings = ? WHERE id = ?", (json.dumps(settings, indent=4), inbound_id))
+        
+        # افزودن به جدول client_traffics
+        sql_traffic = """
+            INSERT INTO client_traffics (inbound_id, enable, email, up, down, total, expiry_time) 
+            VALUES (?, 1, ?, 0, 0, ?, ?)
+        """
+        cursor.execute(sql_traffic, (inbound_id, title, total_bytes, expire_timestamp))
+        
+        conn.commit()
+        return {"status": "success", "message": "User created locally"}
+    except sqlite3.Error as e:
+        conn.rollback()
+        return {"status": "error", "message": f"SQLite error: {e}"}
+
+def insert_new_users():
+    print("Checking for new users to create...")
+    
+    # 1. گرفتن لیست کاربران جدید از سرور مرکزی
+    response = send_api_request('get_new_users', method='GET')
+    
+    if not response or response.get('status') != 'success':
+        print("Failed to get new users from the central server or no new users.")
+        if response:
+            print(f"API Response: {response.get('message')}")
+        return
+
+    new_users = response.get('data', [])
+    if not new_users:
+        print("No new users assigned to this server.")
+        return
+
+    print(f"Found {len(new_users)} new user(s) to create.")
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_URL)
+        created_count = 0
+        for user in new_users:
+            token = user.get('token')
+            item_id = user.get('item_id')
+            user_token_unique = f"{token}_{item_id}"
+            
+            print(f"Processing user: {user_token_unique}")
+            
+            # 2. ایجاد کاربر در دیتابیس محلی
+            result = create_user_local(
+                conn=conn,
+                inbound_port=user.get('config_port'),
+                uuid=user.get('uuid'),
+                total_gb=user.get('usage_max'),
+                title=user_token_unique,
+                expire_days=user.get('DAY')
+            )
+            
+            if result.get('status') == 'success':
+                print(f"User {user_token_unique} created locally. Confirming with central server...")
+                
+                # 3. تایید ساخت کاربر به سرور مرکزی
+                confirm_payload = {
+                    "user_token": user_token_unique,
+                    "config_id": user.get('config_tag_id') # یا هر فیلد دیگری که به عنوان config_id استفاده می‌کنید
+                }
+                confirm_response = send_api_request('confirm_user_creation', data=confirm_payload, method='POST')
+                
+                if confirm_response and confirm_response.get('status') == 'success':
+                    print(f"Confirmation for {user_token_unique} was successful.")
+                    created_count += 1
+                else:
+                    print(f"Failed to confirm creation for {user_token_unique}.")
+                    if confirm_response: print(f"API Response: {confirm_response.get('message')}")
+            
+            elif result.get('message') in ["title already exists", "uuid already exists"]:
+                 print(f"User {user_token_unique} seems to exist already. Confirming with server just in case.")
+                 confirm_payload = { "user_token": user_token_unique, "config_id": user.get('config_tag_id') }
+                 send_api_request('confirm_user_creation', data=confirm_payload, method='POST')
+
+            else:
+                print(f"Failed to create user {user_token_unique} locally. Reason: {result.get('message')}")
+
+        if created_count > 0:
+            print(f"\nTotal of {created_count} users created. Restarting x-ui to apply changes.")
+            restart_xui_in_thread()
+        else:
+            print("\nNo new users were successfully created in this run.")
+            
+    except sqlite3.Error as e:
+        print(f"A general SQLite error occurred: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred during user creation process: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def restart_xui_in_thread():
-  os.system("systemctl restart x-ui")
-  
-def get_my_ip():
-  import socket
-  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-  s.connect(("8.8.8.8", 80))
-  ip = s.getsockname()[0]
-  s.close()
-  return ip
-
-def randomStringDigits(stringLength=10):
-  lettersAndDigits = string.ascii_letters + string.digits
-  return ''.join(random.choice(lettersAndDigits) for i in range(stringLength))
+    print("Restarting x-ui service...")
+    os.system("x-ui restart")
+    time.sleep(2)
+    print("x-ui restarted.")
 
 
-my_ip = get_my_ip()
-
-
-
-def disable_user(email):
-  sql = f"SELECT inbound_id FROM client_traffics WHERE `email`  = '{email}' LIMIT 1"
-  
-  conn = sqlite3.connect(dburl)
-  # run 
-  c = conn.cursor()
-  c.execute(sql)
-  main_data  = c.fetchall()
-  if len(main_data) == 0:
-    return {"status": "error", "message": "port is not found"}
-  inbound_id = main_data[0][0]
-  # c.execute(f"UPDATE client_traffics SET `enable` = 0 WHERE `email` = '{email}'")
-  
-  # conn.commit()
-  c.execute(f"SELECT settings  FROM inbounds WHERE id = {inbound_id} LIMIT 1")
-  # fetch one
-  main_data  =  c.fetchall()
-  clients = json.loads(main_data[0][0])
-  users = clients['clients']
-  for i in range(len(users)):
-    if users[i]['email'] == email:
-      if( users[i]['enable'] == False ):
-        return {"status": "success", "email": email, "message": "user already disabled"}
-      users[i]['enable'] = False
-      break
-    
-
-  clients['clients'] = users
-  try:  
-    c.execute("UPDATE inbounds SET settings = ? WHERE id = ?", (json.dumps(clients, indent = 4, sort_keys = True),inbound_id))
-    conn.commit()
-    
-  except sqlite3.OperationalError as e:
-    return (e)
-  
-
-  return {"status": "success", "email": email, "message": "user disabled"}
-
-
-def create_user( inbound_port_target, id, total_traffics , title, expire_date, config_id):
-    # print('http://' + address + ':4000' + '/create?inbound_port_target=' + str(port) + '&id=' + uuid + '&trafiic=' + str(mass) + '&title=' + token + '&expire=' + str(day) + '')
-
-    if(inbound_port_target == 0):
-        return "Please select a port 2" 
-    if(total_traffics != 0):
-      total_traffics = float(total_traffics) * 1024 * 1024 * 1024
-
-        # connect to db
-    conn = sqlite3.connect(dburl)
-
-    expire_date = int(expire_date)
-    if(expire_date != 0):  
-      # convert expire_date_day to timestamp + 000
-      expire_date = ((expire_date * 86400) + int(jdatetime.datetime.now().timestamp()) ) * 1000
-    
-    # convert total_traffics to bytes
-
-    c = conn.cursor()
-    
-
-    
-    # check title is exist
-    c.execute("SELECT id FROM client_traffics WHERE email = ?", (title,))
-    # if more then 0 return
-    if len(c.fetchall()) > 0:
-      return {"status": "error", "message": "title is already exist"}
-    
-    print(f"SELECT settings,id  FROM inbounds WHERE port = {int(inbound_port_target)} LIMIT 1")
-    
-    # inbound table
-    c.execute(f"SELECT settings,id  FROM inbounds WHERE port = {int(inbound_port_target)} LIMIT 1")
-    # fetch one
-    main_data  =  c.fetchall()
-    
-    
-    if main_data == "[]" or main_data == []:
-        return {"status": "error", "message": "1port is not found"}
-      
-    # orubt*
-    # print(main_data)
-    # print(main_data)
-    clients = json.loads(main_data[0][0]) 
-    inbound_id =  main_data[0][1]
-    
-    for client in clients['clients']:
-      if client['id'] == str(id):
-        return {"status": "error", "message": "id is already exist"}
-
-    first_client = (clients['clients'][0])
-    new_client = first_client.copy()
-    new_client['id'] = str(id)
-    new_client['totalGB'] = int(total_traffics)
-    new_client['email'] = str(title)
-    new_client['subId'] = str(randomStringDigits (10))
-    new_client['enable'] = True
-    new_client['expiryTime'] = int(expire_date)
-
-      
-    # add new client to clients
-    clients['clients'].append(new_client)
-
-    sql_traffic_tbl = f"INSERT INTO client_traffics  (`inbound_id`, `enable`, `email`, `total`, `up`, `down`, `expiry_time`) VALUES ({inbound_id}, 1, '{title}', {int(total_traffics)}, 0, 0,  {int(expire_date)})"
-
-    try:
-      c.execute(sql_traffic_tbl)
-      conn.commit()
-    except Exception as error:
-      return (error)
-    try:  
-      c.execute("UPDATE inbounds SET settings = ? WHERE port = ?", (json.dumps(clients, indent = 4, sort_keys = True),inbound_port_target))
-      conn.commit()
-    except sqlite3.OperationalError as e:
-      return (e)
-
-    
-    # restart x-ui
-    time.sleep(0.5)
-    # restart_xui_in_thread()
-    return {"status": "success", "message": "user creating", "data": ""}
-
-
-def convert_mapped_ipv4(address):
-    if address.startswith('::ffff:'):
-        ipv4_address = ipaddress.IPv6Address(address).ipv4_mapped
-        return str(ipv4_address)
-    else:
-        return address
-mycursor = mydb.cursor()
-def is_ip_or_url(input_str):
-    try:
-        ipaddress.ip_address(input_str)
-        return False  # اگر ورودی یک IP باشد
-    except ValueError:
-        try:
-            urlparse(input_str)
-            return True  # اگر ورودی یک URL باشد
-        except ValueError:
-            return False  # اگر ورودی هیچکدام نباشد
-def create_user_in_target_server(address, port, uuid, mass, token, day, config_id):
-    print("1address : " + address + " port : " + str(port) + " uuid : " + uuid + " mass : " + str(mass) + " token : " + token)
-    global mycursor
-    # send request tp http://$address:4000/create
-    import requests
-    import json
-    # try:
-        # if check_user_is_exist_in_target_server(address, token):
-        #     return
-    # except Exception as e:
-    #     print("check_user_is_exist_in_target_server error : " + str(e))
-    # print('http://' + address + ':4000' + '/create?inbound_port_target=' + str(port) + '&id=' + uuid + '&trafiic=' + str(mass) + '&title=' + token + '&expire=' + str(day) + '')
-    # response = requests.post('http://' + address + ':4000' + '/create?inbound_port_target=' + str(port) + '&id=' + uuid + '&trafiic=' + str(mass) + '&title=' + token + '&expire=' + str(day) + '')
-    res = create_user (  port,   uuid,  mass,  token,  day,  config_id)
-    # response = requests.post('http://' + address + ':4000' + '/create?inbound_port_target=' + str(port) + '&id=' + uuid + '&trafiic=' + str(mass) + '&title=' + token + '&expire=' + str(day) + '')
-    # print(response.text)
-    # if(response.status_code == 200):
-    # print (res)
-    if((res)['status'] == "error"):
-        message = (res['message'])
-        print(message)
-        if(message == "id is already exist" or message =="title is already exist"):
-          sql = f"INSERT INTO tbl_users_configs (user_token, config_id) VALUES ('{token}', '{config_id}')"
-          mycursor.execute(sql)
-          mydb.commit()
-          print (f"successfully created on {address}")
-              
-          
-            
-    if((res)['status'] == 'success'):
-        sql = f"INSERT INTO tbl_users_configs (user_token, config_id) VALUES ('{token}', '{config_id}')"
-        mycursor.execute(sql)
-        mydb.commit()
-        print (f"successfully created on {address}")
-            
-    # else:
-        # TODO send error report in telegram
-        # sendMessageToTelegramBot (f"ادمین جون مثل اینکه مشکلی در ساخت یوزر برای کاربرمون ایجاد شده \nشناسه کاربر: {token} \n مشکل داخلی: {response.text} \n uuid کاربر : {uuid} \n در سرور {address} \n با این جواب : {json.loads(response.text)} ")
-        # print("unkown error")
-          
-def vless_url_export_ip(uri_config, ipv4):
-    address = ''
-    
-    # Parse the URL
-    url_parts = urlparse(uri_config)
-
-    # Get the query parameters
-    query_params = parse_qs(url_parts.query)
-
-    # Check the security parameter
-    security = query_params.get('security', [''])[0]
-
-    # Check if security is 'none' or 'reality'
-    if security == 'none' or not security:
-        # Return the host value
-        address = query_params.get('host', '')
-    elif security == 'reality':
-        # Return the address value (IP address)
-        matches = re.search('@(.*):', uri_config)
-        ip_address = matches.group(1) if matches else ''   
-        address = ip_address
-    elif security == 'tls':
-        # Return the host value
-        address = query_params.get('host', '')
-    else:
-        matches = re.search('@(.*):', uri_config)
-        ip_address = matches.group(1) if matches else ''
-        address = ip_address
-    # if address is list  convert to string
-    if isinstance(address, list):
-        address = address [0]
-         
-     
-    if(address.startswith('[') and address.endswith(']')):
-        # remove [ and ] from start and end
-        address = address[1:-1]
-    if(address.startswith('::ffff') ):
-        # remove [ and ] from start and end
-        address = convert_mapped_ipv4(address)
-        
-    address = address.lower()
-    
-    if (is_ip_or_url(address) == True):
-        address = ipv4
-        
-    if (address == '' or address == None):
-        address = ipv4
-    return {'host': address, 'port': url_parts.port}
-
-
-
-# exit(0)
-  
-
-
-  
-
-
-def find_id_with_email(email):
-  sql = f"SELECT settings,id, port  FROM inbounds WHERE `settings`  LIKE  '%{email}%' LIMIT 1"
-  conn = sqlite3.connect(dburl)
-  # run 
-  c = conn.cursor()
-  c.execute(sql)
-#   return main_data[0][0]
-  main_data  =  c.fetchall()
-  if len(main_data) == 0:
-      return None
-  clients = json.loads(main_data[0][0])
-  inbound_id =  main_data[0][1]
-  port =  main_data[0][2]
-  
-
-  for client in clients['clients']:
-    if client['email'] == str(email):
-      return  {'id': client['id'], "inbound_id" :  inbound_id, "port": port}
-
-
-def get_all_users():
-  sql = f"""SELECT
-	tbl_user.id,
-	tbl_user.token,
-	tbl_user.config_tag_id,
-	tbl_user.TIME,
-	tbl_user.DAY,
-	tbl_user.usage_max,
-	tbl_user.email,
-	tbl_config.config,
-	tbl_config.ip,
-	tbl_config.item_id,
-	
-	tbl_user.user_enabling ,
-	 IFNULL(tbl_users_configs.id, 0) as ConfigCreated,
-  	tbl_config.port
-FROM
-	tbl_user
-	INNER JOIN tbl_config ON FIND_IN_SET( tbl_user.config_tag_id, tbl_config.id ) 
-	LEFT JOIN tbl_users_configs ON tbl_users_configs.user_token = CONCAT(tbl_user.token, "_", tbl_config.item_id)
-WHERE
-
-	tbl_user.is_new = 'new_user'  AND tbl_config.ip = '{my_ip}'  AND IFNULL(tbl_users_configs.id, 0) = 0
-	
-ORDER BY tbl_user.id DESC"""
-
-  
-  mycursor.execute(sql)
-  myresult = mycursor.fetchall()
-  
-  return myresult
-
-def get_all_configs():
-  sql = "SELECT 			 *			 FROM 			 tbl_config "
-  mycursor.execute(sql)
-  myresult = mycursor.fetchall()
-  # return as list
-  return myresult
-  
-  pass
-
-def convert_numbers(input_string):
-    conversion_map = {'1': 1, '2': 110, '3': 112, '4': 140}
-    input_list = [int(num) for num in input_string.split(',')]
-    return [conversion_map.get(str(num), num) for num in input_list]
-
-def inser_users():
-
-  myresult = get_all_users()
-  
-  # configs =  get_all_configs()
-  
-  
-
-  for x in myresult:
-    
-    if(x[11] != 0):
-      continue
-    
-      
-    # for config in configs:
-    # config_ids = convert_numbers(str(config[1]))
-    
-    
-    # if(x[2] not in config_ids):
-    #   continue
-    
-    
-    # find in list
-    
-    
-    
-    
-    
-    vless_url = vless_url_export_ip(x[7], x[8])
-    # print(str(vless_url ['host'] == my_ip) + config['config'])
-    if(vless_url ['host'] == my_ip):
-      # check in user usage table user exited or not
-      
-      # check for user is enabled
-      is_enabled = x[10]      
-      if(is_enabled == 0):
-        # return
-        disable_user(x[1] + "_" + str(x[9]))
-        continue
-      
-      # check for user is inserted in main table
-      # sql_check_user = f"SELECT id FROM tbl_users_configs WHERE user_token = '{x[1]}_{x[9]}' LIMIT 1"
-      
-      # mycursor.execute(sql_check_user)
-      # myresult_checker = mycursor .fetchall()
-      # if(len(myresult_checker) > 0):
-      #     # continue
-      #   print("user already inserted")
-      #   continue
-      
-      # instring to table and creating USER
-      email = x[1]
-      id = x[6]
-      config_id = 1
-      day = x[4]
-      mass = x[5]
-      port = vless_url ['port']
-      alternate_port = int( x[12])
-      if alternate_port != 0 :
-        port = alternate_port
-      # print()
-      create_user_in_target_server(my_ip, port, id, mass, email + "_" + str(x[9]), day, config_id)
-    if (vless_url['host'] == None):
-      sendMessageToTelegramBot(f"ادمین جون من ربات منیجر یوزر ها هستم\n مثل اینکه آیپی این کانفیگ رو فراموش کردی تو جدول بزاری\n ممنون میشم یه نیم نگاهی بندازی\nکانفیگ مورد نظر :  \n{config['config']} ")
-
-
-
-
-
-inser_users()
-conn.close()
-mydb.close()
-restart_xui_in_thread()
+if __name__ == "__main__":
+    insert_new_users()

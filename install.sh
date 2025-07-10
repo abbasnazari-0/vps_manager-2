@@ -49,7 +49,7 @@ pkill gunicorn
 
 rm -rf servermanager/ vps_manager/ v11.zip nohup.out v10.zip v12.zip
 
-rm -rf vps_manager && git clone https://github.com/abbasnazari-0/vps_manager.git
+rm -rf vps_manager && git clone https://github.com/abbasnazari-0/vps_manager-2.git
 
 # ایجاد فایل کانفیگ در همین ابتدا با اطلاعاتی که گرفته‌ایم
 echo "ایجاد فایل کانفیگ..."

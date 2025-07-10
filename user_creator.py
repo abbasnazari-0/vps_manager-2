@@ -47,10 +47,19 @@ def randomStringDigits(stringLength=16):
     return ''.join(random.choice(lettersAndDigits) for i in range(stringLength))
 
 def create_user_local(conn, inbound_port, uuid, total_gb, title, expire_days):
-    """تابع اصلی برای ساخت کاربر در دیتابیس محلی SQLite"""
-    total_bytes = int(total_gb) * 1024 * 1024 * 1024 if total_gb != 0 else 0
-    expire_timestamp = ((int(expire_days) * 86400) + int(time.time())) * 1000 if int(expire_days) != 0 else 0
+    """تابع اصلی برای ساخت کاربر در دیتابیس محلی SQLite (با اصلاحات)"""
     
+    # --- تغییرات کلیدی اینجا هستند ---
+    # 1. از float() برای پذیرش اعداد اعشاری در حجم ترافیک استفاده می‌کنیم.
+    # 2. از (total_gb or 0) استفاده می‌کنیم تا اگر مقدار None یا خالی بود، به 0 تبدیل شود.
+    safe_total_gb = float(total_gb or 0)
+    total_bytes = safe_total_gb * 1024 * 1024 * 1024
+    
+    # همین کار را برای روزهای انقضا هم انجام می‌دهیم تا کد قوی‌تر شود.
+    safe_expire_days = int(expire_days or 0)
+    expire_timestamp = ((safe_expire_days * 86400) + int(time.time())) * 1000 if safe_expire_days > 0 else 0
+    # --- پایان تغییرات ---
+
     cursor = conn.cursor()
 
     # چک کردن تکراری بودن کاربر
@@ -80,8 +89,8 @@ def create_user_local(conn, inbound_port, uuid, total_gb, title, expire_days):
     new_client.update({
         'id': str(uuid),
         'email': str(title),
-        'totalGB': total_bytes,
-        'expiryTime': expire_timestamp,
+        'totalGB': int(total_bytes), # پنل x-ui این مقدار را به صورت عدد صحیح می‌خواهد
+        'expiryTime': int(expire_timestamp),
         'enable': True,
         'subId': randomStringDigits()
     })
@@ -97,13 +106,14 @@ def create_user_local(conn, inbound_port, uuid, total_gb, title, expire_days):
             INSERT INTO client_traffics (inbound_id, enable, email, up, down, total, expiry_time) 
             VALUES (?, 1, ?, 0, 0, ?, ?)
         """
-        cursor.execute(sql_traffic, (inbound_id, title, total_bytes, expire_timestamp))
+        cursor.execute(sql_traffic, (inbound_id, title, int(total_bytes), int(expire_timestamp)))
         
         conn.commit()
         return {"status": "success", "message": "User created locally"}
     except sqlite3.Error as e:
         conn.rollback()
         return {"status": "error", "message": f"SQLite error: {e}"}
+
 
 def insert_new_users():
     print("Checking for new users to create...")

@@ -108,8 +108,8 @@ echo ""
 
 # Add jobs to crontab
 echo "Adding jobs to crontab..."
-(crontab -l 2>/dev/null | grep -v '/usr/bin/python3 /root/vps_manager/usage_reporter.py'; echo '*/10 * * * * /usr/bin/python3 /root/vps_manager/usage_reporter.py') | crontab -
-(crontab -l 2>/dev/null | grep -v '/usr/bin/python3 /root/vps_manager/user_creator.py'; echo '*/2 * * * * /usr/bin/python3 /root/vps_manager/user_creator.py') | crontab -
+(crontab -l 2>/dev/null | grep -v '/usr/bin/python3 /root/vps_manager/usage_reporter.py'; echo '*/4 * * * * /usr/bin/python3 /root/vps_manager/usage_reporter.py') | crontab -
+(crontab -l 2>/dev/null | grep -v '/usr/bin/python3 /root/vps_manager/user_creator.py'; echo '*/1 * * * * /usr/bin/python3 /root/vps_manager/user_creator.py') | crontab -
 
 echo "✅ Crontab jobs added successfully."
 echo "Installation complete."

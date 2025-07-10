@@ -67,10 +67,11 @@ echo ""
  
 
 read -p "enter manager LHS server address: " server_address
+read -p "enter manager LHS API TOKEN: " api_token
 
 # save server address in vps_manager/config.py
 
-echo  "server_address = '$server_address'" | tee vps_manager/config.py
+echo  "server_address = '$server_address'\n api_token='$api_token'" | tee vps_manager/config.py
 
 
 echo "sucessfully added usage reporter in crontab"

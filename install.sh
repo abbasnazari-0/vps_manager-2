@@ -18,7 +18,7 @@ echo "Validating API address..."
 response=$(curl -s -m 10 "$server_address")
 
 # Define the expected response for a valid (but unauthorized) endpoint
-expected_response='{"status":"error","message":"Unauthorized"}'
+expected_response='{"status":"error","message":"Authorization header not found."}'
 
 # Compare the received response with the expected one
 if [[ "$response" == "$expected_response" ]]; then
